@@ -19,9 +19,34 @@ app.get('/blockchain', function (req, res) {
 
 // create a new transaction
 app.post('/transaction', function(req, res) {
-    const blockIndex = bitcoin.createNewTransaction(req.body.amount, req.body.sender, req.body.recipient)
+    const newTransaction = req.body;
+	const blockIndex = bitcoin.addTransactionToPendingTransactions(newTransaction);
     // 為了讓 js 能解析 request 的 json 資料要 install body_parser
     res.json({ note: `Transaction will be added in block ${blockIndex}.` });
+});
+
+
+// broadcast transaction
+app.post('/transaction/broadcast', function(req, res) {
+	const newTransaction = bitcoin.createNewTransaction(req.body.amount, req.body.sender, req.body.recipient);
+	bitcoin.addTransactionToPendingTransactions(newTransaction);
+
+	const requestPromises = [];
+	bitcoin.networkNodes.forEach(networkNodeUrl => {
+		const requestOptions = {
+			uri: networkNodeUrl + '/transaction',
+			method: 'POST',
+			body: newTransaction,
+			json: true
+		};
+
+		requestPromises.push(rp(requestOptions));
+	});
+
+	Promise.all(requestPromises)
+	.then(data => {
+		res.json({ note: 'Transaction created and broadcast successfully.' });
+	});
 });
 
 // mine a block
@@ -36,13 +61,69 @@ app.get('/mine', function (req, res) {
 	const blockHash = bitcoin.hashBlock(previousBlockHash, currentBlockData, nonce);
     // 當挖到況的人要給他獎勵幾個數位貨幣，以 '00' 開頭發送等於由區塊鍊發送
     bitcoin.createNewTransaction(12.5, '00', nodeAddress)
-    const newBlock = bitcoin.createNewBlock(nonce, previousBlockHash, blockHash);
+	const newBlock = bitcoin.createNewBlock(nonce, previousBlockHash, blockHash);
+	
+	const requestPromises = [];
+	bitcoin.networkNodes.forEach(networkNodeUrl => {
+		const requestOptions = {
+			uri: networkNodeUrl + '/receive-new-block',
+			method: 'POST',
+			body: { newBlock: newBlock },
+			json: true
+		};
 
-    res.json({ 
-        note: 'New block',
-        block: newBlock
-    });
+		requestPromises.push(rp(requestOptions));
+	});
+
+	Promise.all(requestPromises)
+	.then(data => {
+		const requestOptions = {
+			uri: bitcoin.currentNodeUrl + '/transaction/broadcast',
+			method: 'POST',
+			body: {
+				amount: 12.5,
+				sender: "00",
+				recipient: nodeAddress
+			},
+			json: true
+		};
+
+		return rp(requestOptions);
+	})
+	.then(data => {
+		res.json({
+			note: "New block mined & broadcast successfully",
+			block: newBlock
+		});
+	});
+
 });
+
+
+// receive new block
+app.post('/receive-new-block', function(req, res) {
+	const newBlock = req.body.newBlock;
+	const lastBlock = bitcoin.getLastBlock();
+	// 當其他 block 接收到這個 endpoint 時，要驗證這個 block 合不合法，方法有檢查她的 hash 值
+	// 方法有檢查 block 的 hash 值和檢查 index 數目
+	const correctHash = lastBlock.hash === newBlock.previousBlockHash; 
+	const correctIndex = lastBlock['index'] + 1 === newBlock['index'];
+	// 如果通過驗證才把 block 加到 chain 中，並且把 transaction 清空
+	if (correctHash && correctIndex) {
+		bitcoin.chain.push(newBlock);
+		bitcoin.pendingTransactions = [];
+		res.json({
+			note: 'New block received and accepted.',
+			newBlock: newBlock
+		});
+	} else {
+		res.json({
+			note: 'New block rejected.',
+			newBlock: newBlock
+		});
+	}
+});
+
 
 
 // register a node and broadcast it the network
@@ -102,6 +183,88 @@ app.post('/register-nodes-bulk', function(req, res) {
 	});
 
 	res.json({ note: 'Bulk registration successful.' });
+});
+
+
+// consensus
+app.get('/consensus', function(req, res) {
+	const requestPromises = [];
+	bitcoin.networkNodes.forEach(networkNodeUrl => {
+		const requestOptions = {
+			uri: networkNodeUrl + '/blockchain',
+			method: 'GET',
+			json: true
+		};
+
+		requestPromises.push(rp(requestOptions));
+	});
+
+	Promise.all(requestPromises)
+	.then(blockchains => {
+		const currentChainLength = bitcoin.chain.length;
+		let maxChainLength = currentChainLength;
+		let newLongestChain = null;
+		let newPendingTransactions = null;
+
+		blockchains.forEach(blockchain => {
+			if (blockchain.chain.length > maxChainLength) {
+				maxChainLength = blockchain.chain.length;
+				newLongestChain = blockchain.chain;
+				newPendingTransactions = blockchain.pendingTransactions;
+			};
+		});
+
+
+		if (!newLongestChain || (newLongestChain && !bitcoin.chainIsValid(newLongestChain))) {
+			res.json({
+				note: 'Current chain has not been replaced.',
+				chain: bitcoin.chain
+			});
+		}
+		else {
+			bitcoin.chain = newLongestChain;
+			bitcoin.pendingTransactions = newPendingTransactions;
+			res.json({
+				note: 'This chain has been replaced.',
+				chain: bitcoin.chain
+			});
+		}
+	});
+});
+
+// get block by blockHash
+app.get('/block/:blockHash', function(req, res) { 
+	const blockHash = req.params.blockHash;
+	const correctBlock = bitcoin.getBlock(blockHash);
+	res.json({
+		block: correctBlock
+	});
+});
+
+// get transaction by transactionId
+app.get('/transaction/:transactionId', function(req, res) {
+	const transactionId = req.params.transactionId;
+	const trasactionData = bitcoin.getTransaction(transactionId);
+	res.json({
+		transaction: trasactionData.transaction,
+		block: trasactionData.block
+	});
+});
+
+
+// get address by address，可以取得該address下所有交易紀錄和總和
+app.get('/address/:address', function(req, res) {
+	const address = req.params.address;
+	const addressData = bitcoin.getAddressData(address);
+	res.json({
+		addressData: addressData
+	});
+});
+
+
+// block explorer
+app.get('/block-explorer', function(req, res) {
+	res.sendFile('./block-explorer/index.html', { root: __dirname });
 });
 
  
